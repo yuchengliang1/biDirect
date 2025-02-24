@@ -13,7 +13,10 @@ from einops import rearrange
 
 from DualConvLayer import SpatialConvLayer, TemporalConvLayer
 
-
+# 位置信息通过向量加法的形式修改了原始的特征向量 使其携带了位置的语义
+# emb_size超参数 定义了模型内部表示各种输入单元的特征向量的长度
+# nn.Parameter 自定义位置嵌入 自定义分类Token(CLS Token) 可学习的参数或缩放因子 自定义注意力机制的权重
+# forward 将可学习的位置嵌入（self.pos_emb）叠加到输入的特征（x）上
 class PositionalEmbedding(nn.Module):
     def __init__(self, channels, emb_size, device):
         super().__init__()
@@ -25,7 +28,8 @@ class PositionalEmbedding(nn.Module):
         x = self.pos_emb + x
         return x
 
-
+# nn.Embedding 将离散的整数索引（在这里是模态类型 0 或 1）映射到连续的浮点向量
+# 为拼接的多模态输入注入模态类型信息 可学习的嵌入向量加入原始输入
 class ModalityTypeEmbedding(nn.Module):
     def __init__(self, emb_size, token_type_idx=1):
         super().__init__()
@@ -43,6 +47,7 @@ class ModalityTypeEmbedding(nn.Module):
         return x
 
 
+# 输入特征向量增加可学习参数变为 （batch_size, sequence_length+1, emb_size)
 class AddClsToken(nn.Module):
     def __init__(self, emb_size):
         super().__init__()
@@ -54,7 +59,9 @@ class AddClsToken(nn.Module):
         return x
 
 
+# Q、K、V 通常都是从同一个原始输入序列通过不同的Linear层线性投影得到的
 class MultiHeadAttention(nn.Module):
+    # 初始化多头注意力机制所需的所有组件和参数
     def __init__(self, query_size, key_size, value_size, emb_size, num_heads, dropout, bias=False):
         super().__init__()
         self.emb_size = emb_size
@@ -69,7 +76,7 @@ class MultiHeadAttention(nn.Module):
             nn.Dropout(dropout)
         )
         self.attention_weights = None
-
+    # 定义了多头注意力机制实际的计算流程，也就是如何从输入 query, key, value 得到最终的注意力输出
     def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor = None) -> Tensor:
         queries = rearrange(self.queries(query), "b n (h d) -> b h n d", h=self.num_heads)
         keys = rearrange(self.keys(key), "b n (h d) -> b h n d", h=self.num_heads)
@@ -88,6 +95,7 @@ class MultiHeadAttention(nn.Module):
         return out
 
 
+# 自注意力 Q K V来自同一源 交叉注意力 （Q来自一个源 K V来自另一个源)
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, query_size, key_size, value_size, emb_size, num_heads, dropout, bias=False):
         super().__init__()
@@ -120,7 +128,7 @@ class MultiHeadSelfAttention(nn.Module):
         out = self.projection(out)
         return out
 
-
+# Transformer前馈网络 线性层 GELU激活函数 线性层
 class FeedForwardBlock(nn.Module):
     def __init__(self, emb_size, expansion=2, dropout=0.5):
         super().__init__()
@@ -138,6 +146,7 @@ class FeedForwardBlock(nn.Module):
         return x
 
 
+# 层归一化 多头注意力 残差相加 层归一化 前馈网络 残差相加
 class SelfEncoderBlock(nn.Module):
     def __init__(self, query_size, key_size, value_size, emb_size, num_heads=4, forward_expansion=2, dropout=0.5):
         super(SelfEncoderBlock, self).__init__()
@@ -148,23 +157,29 @@ class SelfEncoderBlock(nn.Module):
         self.norm1 = nn.LayerNorm(emb_size)
         self.norm2 = nn.LayerNorm(emb_size)
 
+        self.dropout_attn = nn.Dropout(dropout)
+        self.dropout_ffn = nn.Dropout(dropout)
+
     def forward(self, x):
         # x是主导模态
         res = x
         x = self.norm1(x)
         y = self.attention(x, x, x)
+        y = self.dropout_attn(y)
         y = y + res
 
         res = y
         y2 = self.norm2(y)
         y2 = self.feed_forward(y2)
+        y2 = self.dropout_ffn(y2)
         y2 = y2 + res
 
         return y2
 
 
+# 输入 -> 层归一化 -> 多头注意力模块 -> 残差相加 -> 层归一化 -> 前馈网络模块 -> 残差相加
 class CrossEncoderBlock(nn.Module):
-    def __init__(self, query_size, key_size, value_size, emb_size, num_heads=4, forward_expansion=2, dropout=0.5):
+    def __init__(self, query_size, key_size, value_size, emb_size, num_heads=4, forward_expansion=2, dropout=0.7):
         super(CrossEncoderBlock, self).__init__()
 
         self.attention = MultiHeadAttention(query_size, key_size, value_size, emb_size, num_heads, dropout)
@@ -174,21 +189,27 @@ class CrossEncoderBlock(nn.Module):
         self.norm2 = nn.LayerNorm(emb_size)
         self.norm3 = nn.LayerNorm(emb_size)
 
+        self.dropout_attn = nn.Dropout(dropout) # 用于注意力输出
+        self.dropout_ffn = nn.Dropout(dropout)  # 用于前馈网络输出
+
     def forward(self, x, y):
         # x是主导模态
         res = x
         x, y = self.norm1(x), self.norm2(y)
         y1 = self.attention(x, y, y)
+        y1 = self.dropout_attn(y1)
         y1 = y1 + res
 
         res = y1
         y2 = self.norm3(y1)
         y2 = self.feed_forward(y2)
+        y2 = self.dropout_ffn(y2)
         y2 = y2 + res
 
         return y2
 
 
+# TransformerCrossEncoder是一个由多个CrossEncoderBlock堆叠而成的整体结构
 class TransformerCrossEncoder(nn.Module):
     def __init__(self, depth, query_size, key_size, value_size, emb_size, num_heads, channels, expansion, dropout,
                  device):
@@ -213,6 +234,7 @@ class TransformerCrossEncoder(nn.Module):
         return self.attention_weights
 
 
+# TransformerCatEncoder是一个将多个SelfEncoderBlock堆叠起来的编码器 接受两个独立的输入序列x和y 核心在于处理和融合这两个序列的信息
 class TransformerCatEncoder(nn.Module):
     def __init__(self, depth, query_size, key_size, value_size, emb_size, num_heads, channels, expansion, dropout,
                  device):
@@ -239,6 +261,7 @@ class TransformerCatEncoder(nn.Module):
         return self.attention_weights
 
 
+# 接收单个输入序列x 对这一个序列进行深度编码和特征提取
 class TransformerSelfEncoder(nn.Module):
     def __init__(self, depth, query_size, key_size, value_size, emb_size, num_heads, channels, expansion, dropout,
                  device):
@@ -279,10 +302,10 @@ class Transformer(nn.Module):
 
 
         self.eeg_spatial_encoder = TransformerSelfEncoder(depth[0], query_size, key_size, value_size, emb_size, num_heads,
-                                                          60, expansion, self_dropout, device)
+                                                          64, expansion, self_dropout, device)
 
         self.nirs_spatial_encoder = TransformerSelfEncoder(depth[0], query_size, key_size, value_size, emb_size,
-                                                           num_heads, 40, expansion, cross_dropout, device)
+                                                           num_heads, 64, expansion, cross_dropout, device)
 
         self.eeg_temporal_encoder = TransformerSelfEncoder(depth[0], query_size, key_size, value_size, emb_size,
                                                            num_heads, channels[0], expansion, cross_dropout, device)
@@ -356,11 +379,12 @@ class AttentionFusion(nn.Module):
         outputs = sum([i * self.alpha[:, index].unsqueeze(1) for index, i in enumerate(out)])
         return outputs
 
-
+# 多层次特征融合 AttentionFusion融合EEG时空特征、NIRS时空特征、交叉模态特征
+# 通过可学习的权重最终分类输出
 class ClassificationHead(nn.Module):
     def __init__(self, num_classes, emb_size, dropout):
         super(ClassificationHead, self).__init__()
-        self.dropout = dropout
+        self.dropout_layer = nn.Dropout(dropout)
         self.attention_weight_sum_fusion = AttentionFusion(emb_size)
         self.attention_weight_sum_eeg = AttentionFusion(emb_size)
         self.attention_weight_sum_nirs = AttentionFusion(emb_size)
@@ -373,7 +397,7 @@ class ClassificationHead(nn.Module):
         self.fusion = nn.Sequential(
             nn.Linear(emb_size * 1, num_classes)
         )
-        self.w = nn.Parameter(torch.Tensor([1., 1., 0.5]), requires_grad=True)
+        self.w = nn.Parameter(torch.Tensor([1., 0.01, 0.01]), requires_grad=True)
 
     def forward(self, out):
         eeg_temporal, nirs_temporal, temporal_cross, eeg_spatial, nirs_spatial, spatial_cross = out
@@ -381,6 +405,11 @@ class ClassificationHead(nn.Module):
         cross_outputs = self.attention_weight_sum_fusion(cross)
         eeg_outputs = self.attention_weight_sum_eeg([eeg_temporal, eeg_spatial])
         nirs_outputs = self.attention_weight_sum_nirs([nirs_temporal, nirs_spatial])
+
+        eeg_outputs = self.dropout_layer(eeg_outputs)
+        nirs_outputs = self.dropout_layer(nirs_outputs)
+        cross_outputs = self.dropout_layer(cross_outputs)
+
         w1 = torch.exp(self.w[0]) / torch.sum(torch.exp(self.w))
         w2 = torch.exp(self.w[1]) / torch.sum(torch.exp(self.w))
         w3 = torch.exp(self.w[2]) / torch.sum(torch.exp(self.w))
@@ -398,7 +427,7 @@ class HybridTransformer(nn.Module):
         self.temporal_conv_layer = TemporalConvLayer(emb_size, conv_dropout)
 
         with torch.no_grad():
-            eeg, nirs = torch.randn(1, 60, 1000), torch.randn(1, 40, 40)
+            eeg, nirs = torch.randn(1, 64, 2000), torch.randn(1, 64, 2000) # <-- 这一行需要修改
             eeg_temporal_token, nirs_temporal_token = self.temporal_conv_layer(eeg, nirs)
             eeg_spatial_token, nirs_spatial_token = self.spatial_conv_layer(eeg, nirs)
             channels = [eeg_temporal_token.shape[-1], eeg_spatial_token.shape[-2], nirs_temporal_token.shape[-1], nirs_spatial_token.shape[-2]]
